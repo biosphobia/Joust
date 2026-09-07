@@ -31,3 +31,34 @@ def test_enumerate_hidraw_from_fake_sysfs(tmp_path: Path):
 def test_device_info_model():
     assert DeviceInfo("/dev/x", VENDOR_ID, PRODUCT_ID_ZCM1, True, "", "hidraw").model is Model.ZCM1
     assert DeviceInfo("/dev/x", VENDOR_ID, PRODUCT_ID_ZCM2, False, "", "hidraw").transport == "usb"
+
+
+def test_normalize_btaddr():
+    from joust.psmove.backends import normalize_btaddr
+
+    assert normalize_btaddr("00-06-F7-AA-BB-CC") == "00:06:f7:aa:bb:cc"
+    assert normalize_btaddr("0006f7aabbcc") == "00:06:f7:aa:bb:cc"
+    assert normalize_btaddr("00:06:f7:aa:bb:cc") == "00:06:f7:aa:bb:cc"
+    assert normalize_btaddr("") == ""
+    assert normalize_btaddr("not-an-address") == ""
+
+
+def test_hidapi_enumeration_dedupes_and_detects_bluetooth(monkeypatch):
+    from joust.psmove import backends
+
+    class FakeHid:
+        @staticmethod
+        def enumerate(vid, pid):
+            if pid != PRODUCT_ID_ZCM2:
+                return []
+            return [
+                {"path": b"\\\\?\\hid#col01", "serial_number": "00-06-F7-11-22-33"},
+                {"path": b"\\\\?\\hid#col02", "serial_number": "00-06-F7-11-22-33"},
+                {"path": b"\\\\?\\hid#usb", "serial_number": ""},
+            ]
+
+    monkeypatch.setattr(backends, "_import_hid", lambda: FakeHid)
+    found = list(backends.enumerate_hidapi())
+    assert len(found) == 2
+    assert found[0].bluetooth and found[0].address == "00:06:f7:11:22:33"
+    assert not found[1].bluetooth and found[1].transport == "usb"

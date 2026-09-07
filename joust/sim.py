@@ -6,8 +6,8 @@ join the lobby and occasionally get jostled so a round plays itself.
 """
 from __future__ import annotations
 
+import collections
 import logging
-import math
 import random
 import threading
 import time
@@ -27,6 +27,7 @@ class SimController:
         self.connected = True
         self.calibration = AccelCalibration.nominal(model)
         self.latest: Optional[InputReport] = None
+        self._queue: collections.deque[InputReport] = collections.deque(maxlen=1024)
         self.leds = (0, 0, 0)
         self.rumble = 0
         self.reports = 0
@@ -45,6 +46,14 @@ class SimController:
 
     def set_rumble(self, value: int) -> None:
         self.rumble = value
+
+    def drain(self) -> list[InputReport]:
+        out = []
+        while True:
+            try:
+                out.append(self._queue.popleft())
+            except IndexError:
+                return out
 
     # -- puppet strings ---------------------------------------------------------------
 
@@ -87,6 +96,7 @@ class SimController:
             accel_frames=(raw, raw),
         )
         self.latest = rep
+        self._queue.append(rep)
         self.reports += 1
         return rep
 
@@ -147,14 +157,24 @@ class AutoPlayer:
             return
         if phase == "playing":
             if now < self._bump_until:
+                if getattr(self, "_release_at", 0) and now >= self._release_at:
+                    self.c.release(Button.MOVE)
+                    self._release_at = 0
                 return
             if self._bump_until:
                 self.c.set_motion(1.0)
                 self._bump_until = 0.0
                 self._next_action = now + self.rng.uniform(3.0, 12.0)
             elif now >= self._next_action:
-                # a bump: either a nudge (warning) or a proper shove (death)
+                # a bump: either a nudge (warning) or a proper shove (death);
+                # half the time the player tries a ninja dodge first
+                if self.rng.random() < 0.5:
+                    self.c.press(Button.MOVE)
+                    self._release_at = now + 0.1
                 self.c.set_motion(self.rng.choice([1.7, 1.9, 2.4, 3.0]))
                 self._bump_until = now + self.rng.uniform(0.15, 0.4)
+            if getattr(self, "_release_at", 0) and now >= self._release_at:
+                self.c.release(Button.MOVE)
+                self._release_at = 0
             return
         self.c.set_motion(1.0)

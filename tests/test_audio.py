@@ -55,3 +55,14 @@ def test_mixer_sfx_and_silence():
     out = m.render(64)
     assert np.allclose(out[:36], 0.5) and not np.any(out[36:])
     assert not np.any(m.render(64))
+
+
+def test_whoosh_and_denied():
+    w = synth.sfx_whoosh(48000)
+    assert w.shape == (int(0.45 * 48000), 2)
+    assert 0.5 < np.max(np.abs(w)) <= 0.8
+    # energy peaks in the middle of the sweep
+    thirds = np.array_split(np.abs(w[:, 0]), 3)
+    assert thirds[1].mean() > thirds[0].mean() and thirds[1].mean() > thirds[2].mean()
+    d = synth.sfx_denied(48000)
+    assert d.shape[1] == 2 and np.max(np.abs(d)) > 0.1

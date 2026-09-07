@@ -7,6 +7,7 @@ one per ~120 ms unless nothing changed.
 """
 from __future__ import annotations
 
+import collections
 import logging
 import threading
 import time
@@ -38,6 +39,7 @@ class Controller:
         self.calibration = self._load_calibration()
 
         self.latest: Optional[P.InputReport] = None
+        self._queue: collections.deque[P.InputReport] = collections.deque(maxlen=1024)
         self.last_report_time = 0.0
         self.connected = True
         self.reports = 0
@@ -90,6 +92,15 @@ class Controller:
     def add_listener(self, fn: Callable[[P.InputReport], None]) -> None:
         self._listeners.append(fn)
 
+    def drain(self) -> list[P.InputReport]:
+        """Return every report received since the last call, oldest first."""
+        out = []
+        while True:
+            try:
+                out.append(self._queue.popleft())
+            except IndexError:
+                return out
+
     def _read_loop(self) -> None:
         silent_since = time.monotonic()
         while not self._stop.is_set():
@@ -113,6 +124,7 @@ class Controller:
             except ValueError:
                 continue
             self.latest = report
+            self._queue.append(report)
             self.last_report_time = time.monotonic()
             self.reports += 1
             self.connected = True

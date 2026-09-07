@@ -1,4 +1,6 @@
-Drop music files here (wav, flac, ogg, mp3). `joust play` picks one at random.
+Drop songs here (wav, flac, ogg, mp3). `joust play` picks one at random and
+moves on to a different random song after every round. Files added while
+the game is running are picked up automatically.
 
 The original game uses J.S. Bach's Brandenburg Concertos; public-domain
 recordings are available from e.g. musopen.org. If this folder is empty the

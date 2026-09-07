@@ -12,10 +12,8 @@ get_feature_report(), send_feature_report(), close().
 """
 from __future__ import annotations
 
-import fcntl
 import os
-import select
-import struct
+import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -126,10 +124,14 @@ def enumerate_hidraw(sysfs: Path = SYSFS_HIDRAW) -> Iterator[DeviceInfo]:
 
 class HidrawTransport:
     def __init__(self, info: DeviceInfo):
+        if not sys.platform.startswith("linux"):
+            raise RuntimeError("the hidraw backend only exists on Linux; use the hidapi backend")
         self.info = info
         self.fd = os.open(info.path, os.O_RDWR | os.O_NONBLOCK)
 
     def read(self, size: int, timeout_ms: int) -> bytes:
+        import select
+
         r, _, _ = select.select([self.fd], [], [], timeout_ms / 1000.0)
         if not r:
             return b""
@@ -142,12 +144,16 @@ class HidrawTransport:
         return os.write(self.fd, data)
 
     def get_feature_report(self, report_id: int, size: int) -> bytes:
+        import fcntl
+
         buf = bytearray(size)
         buf[0] = report_id
         n = fcntl.ioctl(self.fd, HIDIOCGFEATURE(size), buf, True)
         return bytes(buf[:n]) if isinstance(n, int) and n > 0 else bytes(buf)
 
     def send_feature_report(self, data: bytes) -> int:
+        import fcntl
+
         buf = bytearray(data)
         fcntl.ioctl(self.fd, HIDIOCSFEATURE(len(buf)), buf, True)
         return len(buf)
@@ -173,25 +179,40 @@ def _import_hid():
         return None
 
 
+_BTADDR_RE = re.compile(r"^([0-9a-f]{2})[:\-]?([0-9a-f]{2})[:\-]?([0-9a-f]{2})[:\-]?([0-9a-f]{2})[:\-]?([0-9a-f]{2})[:\-]?([0-9a-f]{2})$")
+
+
+def normalize_btaddr(text: str) -> str:
+    """'00-06-F7-AA-BB-CC' / '0006f7aabbcc' -> '00:06:f7:aa:bb:cc', or '' if not an address."""
+    m = _BTADDR_RE.match((text or "").strip().lower())
+    return ":".join(m.groups()) if m else ""
+
+
 def enumerate_hidapi() -> Iterator[DeviceInfo]:
     hid = _import_hid()
     if hid is None:
         return
+    seen: set[str] = set()
     for pid in PRODUCT_IDS:
         for d in hid.enumerate(VENDOR_ID, pid):
             path = d["path"]
             if isinstance(path, bytes):
                 path = path.decode(errors="replace")
-            serial = (d.get("serial_number") or "").lower()
-            # psmoveapi convention: bluetooth devices expose their address as
-            # the serial number; USB devices report an empty serial.
-            bluetooth = bool(serial) and ":" in serial
+            # psmoveapi convention (all platforms): a controller connected over
+            # bluetooth reports its own address as the serial number; over USB
+            # the serial is empty.  Windows lists several HID collections per
+            # device, so de-duplicate by address.
+            address = normalize_btaddr(d.get("serial_number") or "")
+            key = address or path
+            if key in seen:
+                continue
+            seen.add(key)
             yield DeviceInfo(
                 path=path,
                 vendor_id=VENDOR_ID,
                 product_id=pid,
-                bluetooth=bluetooth,
-                address=serial if bluetooth else "",
+                bluetooth=bool(address),
+                address=address,
                 backend="hidapi",
             )
 
@@ -203,11 +224,13 @@ class HidapiTransport:
             raise RuntimeError("hidapi backend requested but the 'hid' package is not installed")
         self.info = info
         path = info.path.encode() if isinstance(info.path, str) else info.path
-        if hasattr(hid, "Device"):
-            self._dev = hid.Device(path=path)
-        else:  # older 'hid' package API
+        if hasattr(hid, "device"):  # 'hidapi' package (cython-hidapi)
             self._dev = hid.device()
             self._dev.open_path(path)
+        elif hasattr(hid, "Device"):  # 'hid' package (pyhidapi)
+            self._dev = hid.Device(path=path)
+        else:
+            raise RuntimeError("unrecognised 'hid' module; install the 'hidapi' package")
 
     def read(self, size: int, timeout_ms: int) -> bytes:
         data = self._dev.read(size, timeout_ms)

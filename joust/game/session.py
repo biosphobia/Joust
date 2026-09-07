@@ -28,6 +28,7 @@ class ControllerLike(Protocol):
     latest: Optional[InputReport]
     calibration: AccelCalibration
 
+    def drain(self) -> list[InputReport]: ...
     def set_leds(self, r: int, g: int, b: int) -> None: ...
     def set_rumble(self, value: int) -> None: ...
 
@@ -61,6 +62,19 @@ BATTERY_SHOW = 2.0
 WARNING_RUMBLE = 230  # ~90%
 DEATH_RUMBLE_STRENGTH = 230
 FLICKER_PERIOD = 0.09
+DODGE_SECONDS = 0.75
+DODGE_COLOR = colors.WHITE
+DODGE_RUMBLE = 120
+
+BUTTON_NAMES = {
+    "move": Button.MOVE,
+    "square": Button.SQUARE,
+    "triangle": Button.TRIANGLE,
+    "circle": Button.CIRCLE,
+    "cross": Button.CROSS,
+    "select": Button.SELECT,
+    "start": Button.START,
+}
 
 
 @dataclass
@@ -83,6 +97,9 @@ class Player:
     last_rumble: int = -1
     died_at_change: float = 0.0
     kills_survived: int = 0
+    dodge_used: bool = False
+    dodge_until: float = 0.0
+    dodge_landed: bool = True
 
     @property
     def serial(self) -> str:
@@ -101,6 +118,9 @@ class Player:
     def just_pressed(self, button: Button) -> bool:
         return bool(self._pressed_edge & button)
 
+    def dodging(self, now: float) -> bool:
+        return now < self.dodge_until
+
     _pressed_edge: int = 0
 
 
@@ -112,6 +132,8 @@ class Settings:
     min_players: int = 2
     dead_led: colors.RGB = colors.DEAD_RED
     auto_start: bool = True
+    dodge_button: Button = Button.MOVE
+    dodge_seconds: float = DODGE_SECONDS
 
 
 class JoustSession:
@@ -145,6 +167,8 @@ class JoustSession:
             "explosion": synth.sfx_explosion(audio.rate),
             "game_over": synth.sfx_game_over(audio.rate),
             "victory": synth.sfx_victory(audio.rate),
+            "whoosh": synth.sfx_whoosh(audio.rate),
+            "denied": synth.sfx_denied(audio.rate),
         }
 
     # -- plumbing ------------------------------------------------------------
@@ -184,37 +208,41 @@ class JoustSession:
 
     # -- per-tick input processing ------------------------------------------------
 
-    def _ingest(self, p: Player, now: float) -> Optional[float]:
-        """Process the newest report; returns |a| in g if a fresh sample arrived."""
-        rep = p.controller.latest
-        if rep is None:
+    def _ingest(self, p: Player, now: float) -> list[float]:
+        """Consume every report since the last tick; returns |a| samples in g.
+
+        Draining (instead of peeking at the latest report) keeps the movement
+        metric independent of the tick rate, which matters on Windows where
+        sleep granularity is coarse.
+        """
+        reports = p.controller.drain()
+        if not reports:
             p._pressed_edge = 0
-            return None
-        if rep.sequence == p.last_sequence and rep.timestamp == getattr(p, "_last_ts", None):
-            p._pressed_edge = 0
-            return None
-        p.last_sequence = rep.sequence
-        p._last_ts = rep.timestamp  # type: ignore[attr-defined]
+            return []
 
-        p._pressed_edge = rep.buttons & ~p.buttons_prev
-        p.buttons_prev = rep.buttons
-
-        trigger_down = rep.trigger > 100
-        if trigger_down and not p.trigger_was_down:
-            p.trigger_down_since = now
-        if not trigger_down:
-            p.trigger_down_since = None
-        p.trigger_was_down = trigger_down
-
-        mag = magnitude(p.controller.calibration.apply(rep.accel))
-        if self.phase is Phase.LOBBY:
-            p.rest.feed(mag)
-        return mag * p.rest.scale
+        edge = 0
+        mags: list[float] = []
+        for rep in reports:
+            edge |= rep.buttons & ~p.buttons_prev
+            p.buttons_prev = rep.buttons
+            trigger_down = rep.trigger > 100
+            if trigger_down and not p.trigger_was_down:
+                p.trigger_down_since = now
+            if not trigger_down:
+                p.trigger_down_since = None
+            p.trigger_was_down = trigger_down
+            mag = magnitude(p.controller.calibration.apply(rep.accel))
+            if self.phase is Phase.LOBBY:
+                p.rest.feed(mag)
+            mags.append(mag * p.rest.scale)
+        p._pressed_edge = edge
+        p.last_sequence = reports[-1].sequence
+        return mags
 
     # -- main entry ---------------------------------------------------------
 
     def tick(self, now: float) -> None:
-        samples: dict[str, Optional[float]] = {}
+        samples: dict[str, list[float]] = {}
         for serial, p in list(self.players.items()):
             samples[serial] = self._ingest(p, now)
 
@@ -350,6 +378,9 @@ class JoustSession:
             p.tracker.reset()
             p.no_rumble_until = now + NO_RUMBLE_AFTER_START
             p.warning_until = 0.0
+            p.dodge_used = False
+            p.dodge_until = 0.0
+            p.dodge_landed = True
             p.leds(p.color)
             p.rumble(0)
         for p in self.players.values():
@@ -366,25 +397,41 @@ class JoustSession:
         denom = max(1, joined - 2)
         return min(1.0, len(self.dead) / denom)
 
-    def _tick_playing(self, now: float, samples: dict[str, Optional[float]]) -> None:
+    def _tick_playing(self, now: float, samples: dict[str, list[float]]) -> None:
         speed = self.tempo.update(now, self._progress())
         self.audio.set_speed(speed)
         th = thresholds_for(self.settings.sensitivity, self.tempo.speed_percent)
 
         for p in self.players.values():
             if p.status is Status.ALIVE:
-                mag = samples.get(p.serial)
                 if not p.controller.connected:
                     self._kill(p, now, reason="disconnected")
                     continue
-                if mag is not None:
+                if p.just_pressed(self.settings.dodge_button):
+                    self._dodge(p, now)
+                if p.dodging(now):
+                    for mag in samples.get(p.serial, ()):
+                        p.tracker.update(mag)  # keep the average warm, but nothing can hurt you
+                    p.rumble(DODGE_RUMBLE)
+                    p.leds(DODGE_COLOR)
+                    continue
+                if not p.dodge_landed:
+                    # the dodge just expired: forget the motion that happened during it
+                    p.tracker.reset()
+                    p.dodge_landed = True
+                    p.warning_until = 0.0
+                died = False
+                for mag in samples.get(p.serial, ()):
                     change = p.tracker.update(mag)
                     if change > th.death and now > p.no_rumble_until:
                         self._kill(p, now, reason="jostled", change=change, threshold=th.death)
-                        continue
+                        died = True
+                        break
                     if change > th.warning and now > p.no_rumble_until and now >= p.warning_until + WARNING_COOLDOWN:
                         p.warning_until = now + WARNING_DURATION
                         self.emit("warning", serial=p.serial, change=round(change, 2), threshold=round(th.warning, 2))
+                if died:
+                    continue
                 if now < p.warning_until:
                     p.rumble(WARNING_RUMBLE)
                     flick = int(now / FLICKER_PERIOD) % 2 == 0
@@ -400,6 +447,19 @@ class JoustSession:
                 p.leds(self.settings.dead_led)
 
         self._check_winner(now)
+
+    def _dodge(self, p: Player, now: float) -> None:
+        """Ninja dodge: one short burst of invulnerability per round."""
+        if p.dodge_used:
+            self.sfx("denied")
+            self.emit("dodge_denied", serial=p.serial)
+            return
+        p.dodge_used = True
+        p.dodge_until = now + self.settings.dodge_seconds
+        p.dodge_landed = False
+        p.warning_until = 0.0
+        self.sfx("whoosh")
+        self.emit("dodge", serial=p.serial, seconds=self.settings.dodge_seconds)
 
     def _kill(self, p: Player, now: float, reason: str, **extra) -> None:
         p.status = Status.DEAD

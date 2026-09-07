@@ -120,6 +120,33 @@ def sfx_victory(rate: int = RATE) -> np.ndarray:
     return concat(*parts)
 
 
+def sfx_whoosh(rate: int = RATE) -> np.ndarray:
+    """Ninja dodge: a fast noise sweep, low to high to low."""
+    dur = 0.45
+    n = int(dur * rate)
+    rng = np.random.default_rng(11)
+    noise = rng.standard_normal(n).astype(np.float32)
+    t = np.arange(n, dtype=np.float32) / rate
+    # one-pole low-pass whose cutoff sweeps up then down
+    cutoff = 300 + 5000 * np.sin(math.pi * t / dur) ** 2
+    alpha = (2 * math.pi * cutoff / rate).astype(np.float32)
+    alpha = np.clip(alpha / (1 + alpha), 0.0, 0.99)
+    out = np.empty(n, dtype=np.float32)
+    y = 0.0
+    for i in range(n):
+        y += alpha[i] * (noise[i] - y)
+        out[i] = y
+    env = np.sin(math.pi * t / dur) ** 1.5
+    sig = out * env
+    peak = float(np.max(np.abs(sig))) or 1.0
+    return _stereo(sig / peak * 0.8)
+
+
+def sfx_denied(rate: int = RATE) -> np.ndarray:
+    """Soft low double-blip: that dodge is already spent."""
+    return concat(tone(220, 0.06, 0.25, rate), silence(0.03, rate), tone(196, 0.08, 0.25, rate))
+
+
 def sfx_beeps(count: int, rate: int = RATE) -> np.ndarray:
     """N short beeps: used to announce the sensitivity level."""
     parts = []

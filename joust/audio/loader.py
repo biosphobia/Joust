@@ -44,3 +44,27 @@ def pick_music(path: Path | None) -> Path | None:
     choice = random.choice(files)
     log.info("music: %s", choice)
     return choice
+
+
+class Playlist:
+    """Random song rotation: every pick differs from the previous one when possible."""
+
+    def __init__(self, path: Path | None, rng: random.Random | None = None):
+        self.path = path
+        self.rng = rng or random.Random()
+        self.current: Path | None = None
+        self.files: list[Path] = find_music_files(path) if path else []
+
+    def refresh(self) -> None:
+        """Re-scan the folder so songs added while the game runs get picked up."""
+        if self.path:
+            self.files = find_music_files(self.path)
+
+    def next(self) -> Path | None:
+        self.refresh()
+        if not self.files:
+            self.current = None
+            return None
+        candidates = [f for f in self.files if f != self.current] or self.files
+        self.current = self.rng.choice(candidates)
+        return self.current

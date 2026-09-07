@@ -231,3 +231,82 @@ def test_disconnect_counts_as_out():
     out = [d for n, d in w.events if n == "player_out"]
     assert out and out[0]["reason"] == "disconnected"
     assert len(w.session.alive) == 2
+
+
+def test_ninja_dodge_once_per_round():
+    w = World(2)
+    w.start_round()
+    p = w.session.players["sim-0"]
+    events_before = len(w.events)
+
+    # dodge, then get shoved during the window: survives
+    w.sims[0].press(Button.MOVE)
+    w.run(0.05)
+    w.sims[0].release(Button.MOVE)
+    assert p.dodge_used
+    assert "dodge" in [e[0] for e in w.events[events_before:]]
+    assert w.sims[0].leds == (255, 255, 255)
+    assert w.sims[0].rumble > 0
+    assert w.audio.events[-1] == "sfx"
+    w.sims[0].set_motion(4.0)
+    w.run(0.4)
+    assert p.status is Status.ALIVE
+    w.sims[0].set_motion(1.0)
+    w.run(0.6)  # dodge over, held still again: still alive, colour restored
+    assert p.status is Status.ALIVE
+    assert w.sims[0].leds == p.color
+    assert w.sims[0].rumble == 0
+
+    # second press is refused
+    w.sims[0].press(Button.MOVE)
+    w.run(0.05)
+    w.sims[0].release(Button.MOVE)
+    assert "dodge_denied" in w.names()
+    w.sims[0].set_motion(4.0)
+    w.run(0.3)
+    assert p.status is Status.DEAD
+
+    # next round: the dodge is back
+    w.run(DEATH_TO_GAME_OVER + WINNER_CELEBRATION + 1.0)
+    assert w.session.phase is Phase.LOBBY
+    w.sims[0].set_motion(1.0)
+    w.start_round()
+    assert not w.session.players["sim-0"].dodge_used
+
+
+def test_dodge_expiry_forgets_motion_but_not_forever():
+    w = World(2)
+    w.start_round()
+    w.sims[0].press(Button.MOVE)
+    w.run(0.05)
+    w.sims[0].release(Button.MOVE)
+    w.sims[0].set_motion(4.0)  # keep shaking straight through and past the dodge
+    w.run(0.6)  # 0.65 s into a 0.75 s dodge
+    assert w.session.players["sim-0"].status is Status.ALIVE
+    w.run(0.3)  # dodge expired while still shaking: out
+    assert w.session.players["sim-0"].status is Status.DEAD
+
+
+def test_dodge_button_is_configurable():
+    w = World(2, dodge_button=Button.SQUARE)
+    w.start_round()
+    w.sims[0].press(Button.MOVE)
+    w.run(0.05)
+    w.sims[0].release(Button.MOVE)
+    assert not w.session.players["sim-0"].dodge_used
+    w.sims[0].press(Button.SQUARE)
+    w.run(0.05)
+    assert w.session.players["sim-0"].dodge_used
+
+
+def test_every_report_counts_even_with_slow_ticks():
+    """A burst of reports between two ticks must still register a kill."""
+    w = World(2)
+    w.start_round()
+    s = w.sims[0]
+    s.set_motion(4.0)
+    for _ in range(30):  # 30 reports arrive, then one tick
+        s.emit_report()
+    w.now += 0.3
+    w.session.tick(w.now)
+    assert w.session.players["sim-0"].status is Status.DEAD

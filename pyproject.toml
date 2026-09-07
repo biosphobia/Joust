@@ -13,6 +13,8 @@ dependencies = [
     "numpy>=1.24",
     "sounddevice>=0.4",
     "soundfile>=0.12",
+    # Linux talks hidraw directly; every other OS goes through hidapi.
+    "hidapi>=0.14; sys_platform != 'linux'",
 ]
 
 [project.optional-dependencies]

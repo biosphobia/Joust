@@ -16,6 +16,7 @@ from __future__ import annotations
 import logging
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 from . import protocol as P
@@ -138,6 +139,10 @@ def _bluetoothd(action: str) -> None:
         log.warning("systemctl not found; restart bluetoothd by hand")
 
 
+def _is_root() -> bool:
+    return hasattr(os, "geteuid") and os.geteuid() == 0
+
+
 def pair_all(host: str | None = None, register: bool = True) -> list[str]:
     """Pair every USB-connected controller.  Returns their addresses."""
     usb = [d for d in enumerate_devices() if not d.bluetooth]
@@ -147,9 +152,15 @@ def pair_all(host: str | None = None, register: bool = True) -> list[str]:
     hosts = host_bluetooth_addresses()
     if host is None:
         if not hosts:
-            raise RuntimeError("no local bluetooth adapter found; pass --host aa:bb:cc:dd:ee:ff")
+            hint = (
+                "look it up under Settings > Bluetooth & devices > (adapter) or in Device Manager"
+                if sys.platform.startswith("win")
+                else "try `bluetoothctl show` or `hciconfig`"
+            )
+            raise RuntimeError(f"no local bluetooth adapter address found; pass --host aa:bb:cc:dd:ee:ff ({hint})")
         host = hosts[0]
     host = host.lower()
+    linux = sys.platform.startswith("linux")
     paired = []
     for info in usb:
         controller, current_host = read_addresses(info)
@@ -159,11 +170,14 @@ def pair_all(host: str | None = None, register: bool = True) -> list[str]:
             log.info("%s: host address set to %s", controller, host)
         else:
             log.info("%s: host address already %s", controller, host)
-        if register:
-            if os.geteuid() != 0:
+        if register and linux:
+            if not _is_root():
                 log.warning("not root: skipping BlueZ registration (run with sudo to do it)")
             else:
                 register_with_bluez(controller, host, info.model)
                 log.info("%s: registered with BlueZ", controller)
+        elif register:
+            log.info("%s: host address stored; now pair it from the OS bluetooth settings "
+                     "(unplug, press PS, accept 'Motion Controller'; a ZCM1 on Windows needs psmoveapi's psmove pair)", controller)
         paired.append(controller)
     return paired
