@@ -107,7 +107,13 @@ class Controller:
             try:
                 data = self._transport.read(INPUT_READ_SIZE, READ_TIMEOUT_MS)
             except OSError as exc:
-                log.warning("%s: read failed (%s); marking disconnected", self.serial, exc)
+                if self.reports == 0:
+                    log.warning(
+                        "%s: read failed before any report arrived (%s). The controller is probably held by "
+                        "another program (Steam, PSMoveService, DS4Windows) or the wrong HID collection was "
+                        "opened; run `joust list --raw` to inspect.", self.serial, exc)
+                else:
+                    log.warning("%s: read failed (%s); marking disconnected", self.serial, exc)
                 self.connected = False
                 return
             if not data:

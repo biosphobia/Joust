@@ -74,6 +74,20 @@ psmoveapi's `psmove pair` tool for it once, then this game will see it.
 
 `joust list --probe` shows what the PC sees, including battery level.
 
+### Troubleshooting on Windows
+
+Windows lists every Move three times (the HID path contains `&col01#`,
+`&col02#` or `&col03#`). Only `col01` delivers input; the game picks it
+automatically. If you still see a hidapi "read error":
+
+* Run `joust list --raw`. It prints each raw entry and tries a short read
+  on every one, which shows which collection works and whether another
+  program has the controller open.
+* Close anything else that talks to Move controllers (Steam, PSMoveService,
+  DS4Windows) and reconnect the controller.
+* Make sure you are connected over Bluetooth, not USB; the PS3-era ZCM1
+  sends no sensor data over USB.
+
 Bluetooth tip: one adapter handles about 6 or 7 controllers. A class 1 USB
 dongle has better range and lower latency than most built-in adapters.
 

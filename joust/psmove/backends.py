@@ -30,6 +30,9 @@ class DeviceInfo:
     bluetooth: bool  # True when connected over bluetooth, False for USB
     address: str  # controller bluetooth address if known, else ""
     backend: str
+    # Windows only: the "&col02#" HID collection that answers the bluetooth
+    # address feature reports.  Empty everywhere else.
+    addr_path: str = ""
 
     @property
     def model(self) -> Model:
@@ -188,49 +191,103 @@ def normalize_btaddr(text: str) -> str:
     return ":".join(m.groups()) if m else ""
 
 
-def enumerate_hidapi() -> Iterator[DeviceInfo]:
+def _decode_path(path) -> str:
+    return path.decode(errors="replace") if isinstance(path, bytes) else str(path)
+
+
+def raw_hidapi_entries() -> list[dict]:
+    """Every hidapi enumeration entry for a PS Move, untouched (for diagnostics)."""
     hid = _import_hid()
     if hid is None:
-        return
-    seen: set[str] = set()
+        return []
+    out = []
     for pid in PRODUCT_IDS:
         for d in hid.enumerate(VENDOR_ID, pid):
-            path = d["path"]
-            if isinstance(path, bytes):
-                path = path.decode(errors="replace")
-            # psmoveapi convention (all platforms): a controller connected over
-            # bluetooth reports its own address as the serial number; over USB
-            # the serial is empty.  Windows lists several HID collections per
-            # device, so de-duplicate by address.
-            address = normalize_btaddr(d.get("serial_number") or "")
-            key = address or path
-            if key in seen:
-                continue
-            seen.add(key)
-            yield DeviceInfo(
-                path=path,
-                vendor_id=VENDOR_ID,
-                product_id=pid,
-                bluetooth=bool(address),
-                address=address,
-                backend="hidapi",
-            )
+            d = dict(d)
+            d["path"] = _decode_path(d.get("path", b""))
+            out.append(d)
+    return out
+
+
+def enumerate_hidapi() -> Iterator[DeviceInfo]:
+    """List controllers through hidapi.
+
+    Windows quirk (documented in psmoveapi): every controller shows up three
+    times, with "&col01#", "&col02#" and "&col03#" in the path.  Only col01
+    carries the input reports; reading from the others fails with a plain
+    "read error".  col02 is the one that answers the bluetooth-address
+    feature reports.  Other platforms list each controller exactly once.
+    """
+    groups: dict[str, dict[str, object]] = {}
+    order: list[str] = []
+    for d in raw_hidapi_entries():
+        path = d["path"]
+        lower = path.lower()
+        # psmoveapi convention (all platforms): a controller connected over
+        # bluetooth reports its own address as the serial number; over USB
+        # the serial is empty (or "0" on Windows).
+        address = normalize_btaddr(d.get("serial_number") or "")
+        if address:
+            key = address
+        else:
+            # one key for all three collections: they differ only in the
+            # "&col0N#" segment and the instance suffix that follows it
+            key = re.sub(r"&000\d#", "&000X#", re.sub(r"&col0\d#", "&colXX#", lower))
+        if key not in groups:
+            groups[key] = {"pid": d["product_id"], "address": address, "main": "", "addr": "", "first": path}
+            order.append(key)
+        g = groups[key]
+        if "&col01#" in lower:
+            g["main"] = path
+        elif "&col02#" in lower:
+            g["addr"] = path
+        elif "&col0" not in lower and not g["main"]:
+            g["main"] = path  # Linux / macOS: the only entry
+    for key in order:
+        g = groups[key]
+        main = g["main"] or g["first"]
+        yield DeviceInfo(
+            path=str(main),
+            vendor_id=VENDOR_ID,
+            product_id=int(g["pid"]),  # type: ignore[arg-type]
+            bluetooth=bool(g["address"]),
+            address=str(g["address"]),
+            backend="hidapi",
+            addr_path=str(g["addr"]),
+        )
+
+
+# Feature reports that Windows only answers on the "&col02#" collection.
+_ADDR_REPORTS = (0x04, 0x05)
+# psmoveapi: on Windows the ZCM2 wants a 20 byte buffer for report 0x04.
+_WIN_BTADDR_GET_SIZE = 20
+
+
+def _open_hid(hid, path: str):
+    raw = path.encode()
+    if hasattr(hid, "device"):  # 'hidapi' package (cython-hidapi, hid.pyx)
+        dev = hid.device()
+        dev.open_path(raw)
+        return dev
+    if hasattr(hid, "Device"):  # 'hid' package (pyhidapi)
+        return hid.Device(path=raw)
+    raise RuntimeError("unrecognised 'hid' module; install the 'hidapi' package")
 
 
 class HidapiTransport:
     def __init__(self, info: DeviceInfo):
         hid = _import_hid()
         if hid is None:
-            raise RuntimeError("hidapi backend requested but the 'hid' package is not installed")
+            raise RuntimeError("hidapi backend requested but the 'hidapi' package is not installed")
         self.info = info
-        path = info.path.encode() if isinstance(info.path, str) else info.path
-        if hasattr(hid, "device"):  # 'hidapi' package (cython-hidapi)
-            self._dev = hid.device()
-            self._dev.open_path(path)
-        elif hasattr(hid, "Device"):  # 'hid' package (pyhidapi)
-            self._dev = hid.Device(path=path)
-        else:
-            raise RuntimeError("unrecognised 'hid' module; install the 'hidapi' package")
+        self._dev = _open_hid(hid, info.path)
+        self._addr_dev = None
+        if info.addr_path:
+            try:
+                self._addr_dev = _open_hid(hid, info.addr_path)
+            except Exception as exc:  # noqa: BLE001 - only needed for pairing
+                self._addr_dev = None
+                self._addr_error = exc
 
     def read(self, size: int, timeout_ms: int) -> bytes:
         data = self._dev.read(size, timeout_ms)
@@ -239,17 +296,27 @@ class HidapiTransport:
     def write(self, data: bytes) -> int:
         return self._dev.write(bytes(data))
 
+    def _feature_handle(self, report_id: int):
+        if report_id in _ADDR_REPORTS and self._addr_dev is not None:
+            return self._addr_dev
+        return self._dev
+
     def get_feature_report(self, report_id: int, size: int) -> bytes:
-        return bytes(self._dev.get_feature_report(report_id, size))
+        handle = self._feature_handle(report_id)
+        if handle is self._addr_dev and sys.platform.startswith("win"):
+            size = max(size, _WIN_BTADDR_GET_SIZE)
+        return bytes(handle.get_feature_report(report_id, size))
 
     def send_feature_report(self, data: bytes) -> int:
-        return self._dev.send_feature_report(bytes(data))
+        return self._feature_handle(data[0]).send_feature_report(bytes(data))
 
     def close(self) -> None:
-        try:
-            self._dev.close()
-        except Exception:
-            pass
+        for dev in (self._dev, self._addr_dev):
+            try:
+                if dev is not None:
+                    dev.close()
+            except Exception:  # noqa: BLE001
+                pass
 
 
 # ---------------------------------------------------------------------------

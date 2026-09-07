@@ -70,9 +70,36 @@ class MusicManager:
         threading.Thread(target=worker, name="music-advance", daemon=True).start()
 
 
+def _list_raw() -> None:
+    """Dump every hidapi entry and try a short read on each (debugging aid)."""
+    from .psmove.backends import _open_hid, _import_hid, raw_hidapi_entries
+
+    entries = raw_hidapi_entries()
+    if not entries:
+        print("hidapi: no PS Move entries (is the 'hidapi' package installed and a controller connected?)")
+        return
+    hid = _import_hid()
+    for d in entries:
+        keys = ("product_id", "serial_number", "usage_page", "usage", "interface_number", "product_string")
+        desc = " ".join(f"{k}={d.get(k)!r}" for k in keys if k in d)
+        print(f"{d['path']}\n    {desc}")
+        try:
+            dev = _open_hid(hid, d["path"])
+            try:
+                data = dev.read(64, 300)
+                print(f"    read: {len(data)} bytes {'(ok)' if data else '(timeout, no report)'}")
+            finally:
+                dev.close()
+        except Exception as exc:  # noqa: BLE001
+            print(f"    open/read failed: {exc}")
+
+
 def cmd_list(args) -> int:
-    devices = enumerate_devices(args.backend)
     print(f"backends: {', '.join(available_backends()) or 'none (install the hidapi package)'}")
+    if args.raw:
+        _list_raw()
+        return 0
+    devices = enumerate_devices(args.backend)
     if not devices:
         print("no PS Move controllers found")
         return 1
@@ -80,6 +107,8 @@ def cmd_list(args) -> int:
 
     for d in devices:
         line = f"{d.model.value:5} {d.transport:9} {d.label:20} {d.path}"
+        if d.addr_path:
+            line += f"  (addr: {d.addr_path})"
         if args.probe:
             try:
                 c = Controller(d)
@@ -260,6 +289,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("list", help="list connected controllers")
     s.add_argument("--probe", action="store_true", help="open each controller and read battery / accelerometer")
+    s.add_argument("--raw", action="store_true", help="dump every raw hidapi entry and test-read each one (debugging)")
     s.set_defaults(func=cmd_list)
 
     s = sub.add_parser("pair", help="store this PC's bluetooth address in USB-connected controllers (Linux: also registers with BlueZ, run as root)")
