@@ -1,0 +1,6 @@
+# Let regular users talk to PS Move controllers over hidraw.
+# Copy to /etc/udev/rules.d/ then: sudo udevadm control --reload && sudo udevadm trigger
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="054c", ATTRS{idProduct}=="03d5", MODE="0666", TAG+="uaccess"
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="054c", ATTRS{idProduct}=="0c5e", MODE="0666", TAG+="uaccess"
+KERNEL=="hidraw*", SUBSYSTEM=="hidraw", ATTRS{uniq}=="*", KERNELS=="0005:054C:03D5.*", MODE="0666", TAG+="uaccess"
+KERNEL=="hidraw*", SUBSYSTEM=="hidraw", KERNELS=="0005:054C:0C5E.*", MODE="0666", TAG+="uaccess"
